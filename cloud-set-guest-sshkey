@@ -1,0 +1,140 @@
+#!/bin/bash 
+#
+# Init file for SSH Public Keys Download Client
+## Ninefold Edited
+#
+# chkconfig: 345 98 02
+# description: SSH Public Keys Download Client
+
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+
+# Modify this line to specify the user (default is root)
+user=root
+
+
+
+# Add your DHCP lease folders here
+DHCP_FOLDERS_PATH="/var/lib/dhclient/* /var/lib/dhcp3/*"
+DHCP_FOLDERS=$(find $DHCP_FOLDERS_PATH 2>&1 | grep -v find)
+keys_received=0
+file_count=0
+error_count=0
+regenerated_dhclient=0
+cmd="dhclient -q"
+
+if [ -z "$DHCP_FOLDERS" ]; then
+	logger -t "cloud" "No lease files found at all, running dhclient in quiet mode"
+	$cmd
+	regenerated_dhclient=1
+	logger -t "cloud" "dhclient -q executed... waiting 5 seconds before continuing"
+	sleep 5
+	DHCP_FOLDERS=$(find $DHCP_FOLDERS_PATH 2>&1 | grep -v find)
+fi
+
+for DHCP_FILE in $DHCP_FOLDERS
+do
+	if [ -f $DHCP_FILE ]
+	then
+		file_count=$((file_count+1))
+		SSHKEY_SERVER_IP_ARRAY=( $(grep dhcp-server-identifier $DHCP_FILE | tail | uniq | awk '{print $NF}' | tr -d '\;') )
+		
+		if [ -z "$SSHKEY_SERVER_IP_ARRAY" ] && [ "$regenerated_dhclient" -ne 1 ]; then
+			logger -t "cloud" "Could not find a DHCP host in leases file(s), forcing dhclient to dump last DHCP host(s)"
+			$cmd
+			sleep 5
+			regenerated_dhclient=1
+			logger -t "cloud" "dhclient command has been run, searching again"
+			SSHKEY_SERVER_IP_ARRAY=( $(grep dhcp-server-identifier $DHCP_FILE | tail | uniq  | awk '{print $NF}' | tr -d '\;') )
+		fi
+
+		if [ -n "$SSHKEY_SERVER_IP_ARRAY" ] && [ ${#SSHKEY_SERVER_IP_ARRAY[@]} -gt 0 ];	then
+			if [ $keys_received -eq 1 ]; then
+				logger -t "cloud" "ssh keys have been received from $SSHKEY_SERVER_IP, installing keys..."
+				break
+			fi
+			logger -t "cloud" "found ${#SSHKEY_SERVER_IP_ARRAY[@]} unique DHCP hosts in $DHCP_FILE, querying for ssh keys"
+			for i in "${SSHKEY_SERVER_IP_ARRAY[@]}"
+			do
+				logger -t "cloud" "Found ssh key server IP $i in $DHCP_FILE"
+				logger -t "cloud" "Sending request to ssh key server at $i"
+				publickey=$(wget -t 3 -T 20 -O - http://$i/latest/public-keys 2>/dev/null)
+				if [ $? -eq 0 ]; then
+					logger -t "cloud" "Got response from server at $i"
+					
+					case $publickey in
+					
+					"")					logger -t "cloud" "ssh server at $i did not have any keys for the VM"
+											error_count=$((error_count+1))
+											continue
+											;;
+						
+					"bad_request")		logger -t "cloud" "VM sent an invalid request to ssh server at $i"
+											error_count=$((error_count+1))
+											continue
+											;;
+											
+					*)					logger -t "cloud" "VM got a valid ssh keys from server at $i"
+											keys_received=1
+											set_key=$publickey
+											SSHKEY_SERVER_IP=$i
+											break
+											;;
+					esac
+				fi
+			done
+		fi
+	fi
+done
+
+# did we find the keys anywhere?
+if [ "$keys_received" == "0" ]
+then
+    logger -t "cloud" "Failed to get ssh keys from $error_count servers found in $file_count files"
+	echo "Failed to get ssh keys from $error_count servers found in $file_count files"
+    exit 1
+fi
+
+
+
+# set ssh public key
+homedir=$(grep ^$user /etc/passwd|awk -F ":" '{print $6}')
+sshdir=$homedir/.ssh
+authorized=$sshdir/authorized_keys
+restorecon=/sbin/restorecon
+
+
+if [ ! -e $sshdir ]
+then
+    mkdir $sshdir
+fi
+
+if [ ! -e $authorized ]
+then
+    touch $authorized
+fi
+
+cat $authorized|grep -v "$set_key" > $authorized
+echo "$set_key" >> $authorized
+
+if [ -e $restorecon ]
+then
+    $restorecon -R -v $sshdir
+fi
+
+exit 0
